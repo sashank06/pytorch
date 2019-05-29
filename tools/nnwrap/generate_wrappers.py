@@ -1,26 +1,15 @@
 import os
-import sys
-from string import Template, ascii_lowercase
+from string import Template
 from ..cwrap import cwrap
-from ..cwrap.plugins import StandaloneExtension, NullableArguments, AutoGPU
+from ..cwrap.plugins import NNExtension, NullableArguments, AutoGPU
+from ..shared import import_module
 
-BASE_PATH = os.path.realpath(os.path.join(__file__, '..', '..', '..'))
-WRAPPER_PATH = os.path.join(BASE_PATH, 'torch', 'csrc', 'nn')
-THNN_UTILS_PATH = os.path.join(BASE_PATH, 'torch', '_thnn', 'utils.py')
+from ..shared._utils_internal import get_file_path
 
-def import_module(name, path):
-    if sys.version_info >= (3, 5):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    elif sys.version_info >= (3, 0):
-        from importlib.machinery import SourceFileLoader
-        return SourceFileLoader(name, path).load_module()
-    else:
-        import imp
-        return imp.load_source(name, path)
+THNN_H_PATH = get_file_path('torch', 'include', 'THNN', 'generic', 'THNN.h')
+THCUNN_H_PATH = get_file_path('torch', 'include', 'THCUNN', 'generic', 'THCUNN.h')
+
+THNN_UTILS_PATH = get_file_path('torch', '_thnn', 'utils.py')
 
 thnn_utils = import_module('torch._thnn.utils', THNN_UTILS_PATH)
 
@@ -33,8 +22,8 @@ FUNCTION_TEMPLATE = Template("""\
 """)
 
 COMMON_TRANSFORMS = {
-    'THIndex_t': 'long',
-    'THCIndex_t': 'long',
+    'THIndex_t': 'int64_t',
+    'THCIndex_t': 'int64_t',
     'THInteger_t': 'int',
 }
 COMMON_CPU_TRANSFORMS = {
@@ -51,22 +40,27 @@ TYPE_TRANSFORMS = {
     'Float': {
         'THTensor*': 'THFloatTensor*',
         'real': 'float',
+        'accreal': 'double',
     },
     'Double': {
         'THTensor*': 'THDoubleTensor*',
         'real': 'double',
+        'accreal': 'double',
     },
     'CudaHalf': {
         'THCTensor*': 'THCudaHalfTensor*',
         'real': 'half',
+        'accreal': 'float',
     },
     'Cuda': {
         'THCTensor*': 'THCudaTensor*',
         'real': 'float',
+        'accreal': 'float',
     },
     'CudaDouble': {
         'THCTensor*': 'THCudaDoubleTensor*',
         'real': 'double',
+        'accreal': 'double',
     },
 }
 for t, transforms in TYPE_TRANSFORMS.items():
@@ -81,50 +75,60 @@ for t in ['CudaHalf', 'Cuda', 'CudaDouble']:
 def wrap_function(name, type, arguments):
     cname = 'THNN_' + type + name
     declaration = ''
-    declaration += 'extern "C" void ' + cname + '(' + ', '.join(TYPE_TRANSFORMS[type].get(arg.type, arg.type) for arg in arguments) + ');\n'
+    declaration += 'TH_API void ' + cname + \
+        '(' + ', '.join(TYPE_TRANSFORMS[type].get(arg.type, arg.type)
+                        for arg in arguments) + ');\n'
     declaration += FUNCTION_TEMPLATE.substitute(name=type + name, cname=cname)
     indent = ' ' * 4
     dict_indent = ' ' * 6
     prefix = indent + '- '
     for arg in arguments:
         if not arg.is_optional:
-            declaration += prefix + TYPE_TRANSFORMS[type].get(arg.type, arg.type) + ' ' + arg.name + '\n'
+            declaration += prefix + \
+                TYPE_TRANSFORMS[type].get(
+                    arg.type, arg.type) + ' ' + arg.name + '\n'
         else:
             t = TYPE_TRANSFORMS[type].get(arg.type, arg.type)
-            declaration += prefix + 'type: ' + t        + '\n' + \
-                      dict_indent + 'name: ' + arg.name + '\n' + \
-                      dict_indent + 'nullable: True' + '\n'
+            declaration += prefix + 'type: ' + t + '\n' + \
+                dict_indent + 'name: ' + arg.name + '\n' + \
+                dict_indent + 'nullable: True' + '\n'
     declaration += ']]\n\n\n'
     return declaration
 
-def generate_wrappers():
-    wrap_nn()
-    wrap_cunn()
 
-def wrap_nn():
+def generate_wrappers(nn_root=None, install_dir=None, template_path=None):
+    wrap_nn(os.path.join(nn_root, 'THNN', 'generic', 'THNN.h') if nn_root else None, install_dir, template_path)
+    wrap_cunn(os.path.join(nn_root, 'THCUNN', 'generic', 'THCUNN.h') if nn_root else None, install_dir, template_path)
+
+
+def wrap_nn(thnn_h_path, install_dir, template_path):
     wrapper = '#include <TH/TH.h>\n\n\n'
-    nn_functions = thnn_utils.parse_header(thnn_utils.THNN_H_PATH)
+    nn_functions = thnn_utils.parse_header(thnn_h_path or THNN_H_PATH)
     for fn in nn_functions:
         for t in ['Float', 'Double']:
             wrapper += wrap_function(fn.name, t, fn.arguments)
-    with open('torch/csrc/nn/THNN.cwrap', 'w') as f:
+    install_dir = install_dir or 'torch/csrc/nn'
+    try:
+        os.makedirs(install_dir)
+    except OSError:
+        pass
+    with open(os.path.join(install_dir, 'THNN.cwrap'), 'w') as f:
         f.write(wrapper)
-    cwrap('torch/csrc/nn/THNN.cwrap', plugins=[
-        StandaloneExtension('torch._thnn._THNN'),
-        NullableArguments(),
-    ])
+    cwrap(os.path.join(install_dir, 'THNN.cwrap'),
+          plugins=[NNExtension('torch._C._THNN'), NullableArguments()],
+          template_path=template_path)
 
-def wrap_cunn():
+
+def wrap_cunn(thcunn_h_path, install_dir, template_path):
     wrapper = '#include <TH/TH.h>\n'
     wrapper += '#include <THC/THC.h>\n\n\n'
-    cunn_functions = thnn_utils.parse_header(thnn_utils.THCUNN_H_PATH)
+    cunn_functions = thnn_utils.parse_header(thcunn_h_path or THCUNN_H_PATH)
     for fn in cunn_functions:
         for t in ['CudaHalf', 'Cuda', 'CudaDouble']:
             wrapper += wrap_function(fn.name, t, fn.arguments)
-    with open('torch/csrc/nn/THCUNN.cwrap', 'w') as f:
+    install_dir = install_dir or 'torch/csrc/nn'
+    with open(os.path.join(install_dir, 'THCUNN.cwrap'), 'w') as f:
         f.write(wrapper)
-    cwrap('torch/csrc/nn/THCUNN.cwrap', plugins=[
-        StandaloneExtension('torch._thnn._THCUNN'),
-        NullableArguments(),
-        AutoGPU(has_self=False),
-    ])
+    cwrap(os.path.join(install_dir, 'THCUNN.cwrap'),
+          plugins=[NNExtension('torch._C._THCUNN'), NullableArguments(), AutoGPU(has_self=False)],
+          template_path=template_path)

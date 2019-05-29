@@ -1,5 +1,5 @@
 from . import CWrapPlugin
-from string import Template
+
 
 class GILRelease(CWrapPlugin):
 
@@ -22,8 +22,9 @@ class GILRelease(CWrapPlugin):
     ]
 
     def process_option_code_template(self, template, option):
+        if option.get('with_gil', False):
+            return template
         call_idx = template.index('$call')
         template.insert(call_idx, self.BEFORE_CALL)
-        template.insert(call_idx+2, self.AFTER_CALL)
+        template.insert(call_idx + 2, self.AFTER_CALL)
         return self.OPTION_START + template + self.OPTION_END
-
